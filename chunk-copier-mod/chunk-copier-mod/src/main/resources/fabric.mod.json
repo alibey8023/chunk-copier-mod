@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "chunk_copier",
+  "version": "1.0.0",
+  "name": "Chunk Copier",
+  "description": "G tuşuyla chunk kopyala, H tuşuyla yapıştır.",
+  "authors": [],
+  "contact": {},
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.chunkcopier.ChunkCopierClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.15.0",
+    "fabric-api": "*",
+    "minecraft": "~1.21.4",
+    "java": ">=21"
+  }
+}
