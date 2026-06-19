@@ -14,10 +14,12 @@ import net.minecraft.server.integrated.IntegratedServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
+import net.minecraft.util.WorldSavePath;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.WorldChunk;
+import net.minecraft.world.level.storage.LevelStorage;
 import org.lwjgl.glfw.GLFW;
 
 import java.io.File;
@@ -40,8 +42,7 @@ public class ChunkCopierClient implements ClientModInitializer {
     private boolean keyWasDown = false;
     private int scanTick = 0;
 
-    // MC 1.21.4 data version — hardcoded because SharedConstants returns 0 from background thread
-    private static final int DATA_VERSION = 4189;
+    private static final int    DATA_VERSION = 4189; // Minecraft 1.21.4
     private static final String PENDING_FILE = "chunk_copier_pending.nbt";
     private static final String WORLD_NAME   = "ChunkCopierExport";
 
@@ -53,9 +54,7 @@ public class ChunkCopierClient implements ClientModInitializer {
                 GLFW.GLFW_KEY_G,
                 "category.chunkcopier"
         ));
-
         ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
-
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
             Thread t = new Thread(() -> {
                 try { Thread.sleep(3000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
@@ -70,48 +69,33 @@ public class ChunkCopierClient implements ClientModInitializer {
         boolean isDown = gKey.isPressed();
         if (isDown && !keyWasDown) handleG(client);
         keyWasDown = isDown;
-
-        if (state == State.RECORDING) {
-            if (++scanTick >= 60) { // her 3 saniyede bir — FPS için daha az sıklıkta
-                scanTick = 0;
-                scheduleScan(client);
-            }
-        }
+        if (state == State.RECORDING && ++scanTick >= 60) { scanTick = 0; scheduleScan(client); }
     }
 
     private void handleG(MinecraftClient client) {
         if (client.player == null || client.world == null) return;
-
         switch (state) {
             case IDLE -> {
                 copiedBlocks.clear();
                 scannedChunks.clear();
-                scanTick = 60; // ilk basışta hemen tara
-
+                scanTick = 60;
                 ChunkPos start = new ChunkPos(client.player.getBlockPos());
                 refX = start.getStartX();
                 refZ = start.getStartZ();
-
                 state = State.RECORDING;
                 localMsg(client, "§a● §fKayıt başladı! Etrafı gez, chunk'lar arka planda kopyalanıyor.");
                 localMsg(client, "§7G'ye tekrar bas → durdur ve 'ChunkCopierExport' dünyasına yapıştır.");
             }
             case RECORDING -> {
                 state = State.PENDING_PASTE;
-
                 if (copiedBlocks.isEmpty()) {
                     localMsg(client, "§cHiç blok bulunamadı — tekrar dene.");
                     state = State.IDLE;
                     return;
                 }
-
                 localMsg(client, "§a✔ §f" + copiedBlocks.size() + " blok / " + scannedChunks.size()
                         + " chunk kopyalandı. Dünya açılıyor...");
-
-                Thread t = new Thread(() -> {
-                    savePending(client);
-                    openOrCreateWorld(client);
-                });
+                Thread t = new Thread(() -> { savePending(client); openOrCreateWorld(client); });
                 t.setDaemon(true);
                 t.start();
             }
@@ -119,16 +103,13 @@ public class ChunkCopierClient implements ClientModInitializer {
         }
     }
 
-    // Arka planda chunk tara — ana thread'e dokunmaz, FPS korunur
     private void scheduleScan(MinecraftClient client) {
         if (client.player == null || client.world == null) return;
-
         int viewDist = Math.min(client.options.getViewDistance().getValue(), 10);
         ChunkPos center = new ChunkPos(client.player.getBlockPos());
         int minY = client.world.getBottomY();
         int maxY = client.world.getBottomY() + client.world.getHeight();
 
-        // Önce chunk referanslarını ana thread'de topla
         List<WorldChunk> toScan = new ArrayList<>();
         for (int cx = center.x - viewDist; cx <= center.x + viewDist; cx++) {
             for (int cz = center.z - viewDist; cz <= center.z + viewDist; cz++) {
@@ -136,14 +117,12 @@ public class ChunkCopierClient implements ClientModInitializer {
                 if (scannedChunks.contains(key)) continue;
                 WorldChunk chunk = client.world.getChunkManager().getWorldChunk(cx, cz);
                 if (chunk == null) continue;
-                scannedChunks.add(key); // hemen işaretle
+                scannedChunks.add(key);
                 toScan.add(chunk);
             }
         }
-
         if (toScan.isEmpty()) return;
 
-        // Blok iterasyonunu arka plan thread'ine taşı
         Thread scanner = new Thread(() -> {
             Map<String, String> batch = new HashMap<>();
             for (WorldChunk chunk : toScan) {
@@ -162,25 +141,14 @@ public class ChunkCopierClient implements ClientModInitializer {
                     }
                 }
             }
-
-            // Sonuçları ana thread'e bildir
             client.execute(() -> {
                 copiedBlocks.putAll(batch);
-
-                // Yön mesajı — oyuncuya nereye gitmesi gerektiğini söyle
-                int scanned = scannedChunks.size();
-                String dir = directionHint(client, center);
-                localMsg(client, "§7[Chunk Copier] §f" + copiedBlocks.size() + " blok / "
-                        + scanned + " chunk" + dir);
+                localMsg(client, "§7[CC] §f" + copiedBlocks.size() + " blok / " + scannedChunks.size()
+                        + " chunk — §edevam et veya yana git §7(G = durdur)");
             });
         });
         scanner.setDaemon(true);
         scanner.start();
-    }
-
-    // Sağ/sol/ileri/geri yön ipucu
-    private String directionHint(MinecraftClient client, ChunkPos center) {
-        return " — §edevam et §7ya da §eyana git §7(G = durdur)";
     }
 
     private void savePending(MinecraftClient client) {
@@ -198,100 +166,88 @@ public class ChunkCopierClient implements ClientModInitializer {
     }
 
     private void openOrCreateWorld(MinecraftClient client) {
-        // Doğrudan saves/ChunkCopierExport/level.dat yaz — LevelStorage.Session kullanma
-        // createSession() eski bozuk klasör varken exception fırlatıyor, bu yöntem her zaman çalışır
-        Path worldDir = client.runDirectory.toPath().resolve("saves").resolve(WORLD_NAME);
+        LevelStorage storage = client.getLevelStorage();
+
+        // Eski bozuk klasörü sil
         try {
-            java.nio.file.Files.createDirectories(worldDir);
-            writeFlatLevelDatDirect(worldDir.resolve("level.dat"));
+            boolean exists = storage.levelExists(WORLD_NAME);
+            if (exists) {
+                // Eski dünya var — session aç, klasörü bul, kapat, sil
+                try (LevelStorage.Session old = storage.createSession(WORLD_NAME)) {
+                    Path oldDir = old.getDirectory(WorldSavePath.ROOT).getParent();
+                    old.close();
+                    deleteDirectory(oldDir.toFile());
+                } catch (Exception ignored) {}
+            }
+        } catch (Exception ignored) {}
+
+        // Temiz session oluştur ve level.dat yaz
+        LevelStorage.Session session;
+        try {
+            session = storage.createSession(WORLD_NAME);
+            writeLevelDat(session.getDirectory(WorldSavePath.ROOT).resolve("level.dat"));
             client.execute(() -> localMsg(client, "§7'ChunkCopierExport' hazırlandı."));
         } catch (Exception e) {
             client.execute(() -> localMsg(client, "§cDünya oluşturulamadı: " + e.getMessage()));
             return;
         }
 
+        // start(session) — session'ı IntegratedServerLoader'a devret, o yönetir
+        final LevelStorage.Session finalSession = session;
         client.execute(() -> {
             localMsg(client, "§a→ §fChunkCopierExport açılıyor...");
-            client.createIntegratedServerLoader().start(WORLD_NAME, () -> {});
+            client.createIntegratedServerLoader().start(finalSession, () -> {});
         });
     }
 
-    private void writeFlatLevelDatDirect(Path levelDat) throws IOException {
+    private void writeLevelDat(Path path) throws IOException {
         NbtCompound root = new NbtCompound();
-        NbtCompound d    = new NbtCompound();
 
-        // DATA_VERSION sabit: 4189 = Minecraft 1.21.4
-        d.putInt("DataVersion", DATA_VERSION);
-        d.putString("LevelName", WORLD_NAME);
-        d.putInt("GameType", 1);           // Yaratıcı
-        d.putByte("Difficulty", (byte) 1); // Kolay
-        d.putByte("allowCommands", (byte) 1);
-        d.putByte("hardcore", (byte) 0);
-        d.putLong("RandomSeed", 0L);
-        d.putLong("LastPlayed", System.currentTimeMillis());
-        d.putInt("SpawnX", 0);
-        d.putInt("SpawnY", 65);
-        d.putInt("SpawnZ", 0);
-        d.putFloat("SpawnAngle", 0f);
-        d.putLong("Time", 0L);
-        d.putLong("DayTime", 6000L);
-        d.putByte("initialized", (byte) 0);
+        // DataVersion hem root hem Data içinde — Minecraft farklı versiyonlarda farklı yerden okuyabiliyor
+        root.putInt("DataVersion", DATA_VERSION);
 
-        NbtCompound ver = new NbtCompound();
-        ver.putInt("Id", DATA_VERSION);
-        ver.putString("Name", "1.21.4");
-        ver.putString("Series", "main");
-        ver.putByte("Snapshot", (byte) 0);
-        d.put("Version", ver);
+        NbtCompound data = new NbtCompound();
+        data.putInt("DataVersion", DATA_VERSION);
+        data.putString("LevelName", WORLD_NAME);
+        data.putInt("GameType", 1);
+        data.putByte("Difficulty", (byte) 1);
+        data.putByte("allowCommands", (byte) 1);
+        data.putByte("hardcore", (byte) 0);
+        data.putLong("RandomSeed", 0L);
+        data.putLong("LastPlayed", System.currentTimeMillis());
+        data.putInt("SpawnX", 0);
+        data.putInt("SpawnY", 65);
+        data.putInt("SpawnZ", 0);
+        data.putFloat("SpawnAngle", 0f);
+        data.putLong("Time", 0L);
+        data.putLong("DayTime", 6000L);
+        data.putByte("initialized", (byte) 0);
 
-        NbtCompound gr = new NbtCompound();
-        gr.putString("doMobSpawning", "false");
-        gr.putString("doDaylightCycle", "false");
-        gr.putString("doWeatherCycle", "false");
-        gr.putString("keepInventory", "true");
-        d.put("GameRules", gr);
+        NbtCompound version = new NbtCompound();
+        version.putInt("Id", DATA_VERSION);
+        version.putString("Name", "1.21.4");
+        version.putString("Series", "main");
+        version.putByte("Snapshot", (byte) 0);
+        data.put("Version", version);
 
-        NbtCompound dp = new NbtCompound();
-        NbtList dpOn   = new NbtList();
-        dpOn.add(NbtString.of("vanilla"));
-        dp.put("Enabled", dpOn);
-        dp.put("Disabled", new NbtList());
-        d.put("DataPacks", dp);
+        NbtCompound gameRules = new NbtCompound();
+        gameRules.putString("doMobSpawning", "false");
+        gameRules.putString("doDaylightCycle", "false");
+        gameRules.putString("doWeatherCycle", "false");
+        gameRules.putString("keepInventory", "true");
+        data.put("GameRules", gameRules);
 
-        // Dünya oluşturucu: düz dünya
-        NbtCompound wgs  = new NbtCompound();
-        wgs.putLong("seed", 0L);
-        wgs.putByte("bonus_chest", (byte) 0);
-        NbtCompound dims = new NbtCompound();
-
-        NbtCompound ow    = new NbtCompound();
-        ow.putString("type", "minecraft:overworld");
-        NbtCompound owGen = new NbtCompound();
-        owGen.putString("type", "minecraft:flat");
-        NbtCompound flatCfg = new NbtCompound();
-        flatCfg.putString("biome", "minecraft:plains");
-        flatCfg.putByte("features", (byte) 0);
-        flatCfg.putByte("lakes", (byte) 0);
-        NbtList layers = new NbtList();
-        layers.add(layer("minecraft:bedrock", 1));
-        layers.add(layer("minecraft:dirt", 2));
-        layers.add(layer("minecraft:grass_block", 1));
-        flatCfg.put("layers", layers);
-        owGen.put("settings", flatCfg);
-        ow.put("generator", owGen);
-        dims.put("minecraft:overworld", ow);
-        wgs.put("dimensions", dims);
-        d.put("WorldGenSettings", wgs);
-
-        root.put("Data", d);
-        NbtIo.writeCompressed(root, levelDat);
+        root.put("Data", data);
+        NbtIo.writeCompressed(root, path);
     }
 
-    private static NbtCompound layer(String block, int height) {
-        NbtCompound c = new NbtCompound();
-        c.putString("block", block);
-        c.putInt("height", height);
-        return c;
+    private void deleteDirectory(File dir) {
+        if (dir == null || !dir.exists()) return;
+        File[] files = dir.listFiles();
+        if (files != null) for (File f : files) {
+            if (f.isDirectory()) deleteDirectory(f); else f.delete();
+        }
+        dir.delete();
     }
 
     private void tryPastePending(MinecraftClient client) {
@@ -318,14 +274,11 @@ public class ChunkCopierClient implements ClientModInitializer {
 
         AtomicInteger pasted = new AtomicInteger(0);
         Thread t = new Thread(() -> {
-            List<Map.Entry<String, String>> entries = new ArrayList<>(blocks.getKeys().stream()
-                    .map(k -> Map.entry(k, blocks.getString(k))).toList());
+            List<Map.Entry<String, String>> entries = new ArrayList<>(
+                    blocks.getKeys().stream().map(k -> Map.entry(k, blocks.getString(k))).toList());
 
-            // 500'er blok partiler halinde ana thread'de yapıştır
-            int batchSize = 500;
-            for (int i = 0; i < entries.size(); i += batchSize) {
-                int from = i;
-                int to   = Math.min(i + batchSize, entries.size());
+            for (int i = 0; i < entries.size(); i += 500) {
+                int from = i, to = Math.min(i + 500, entries.size());
                 client.execute(() -> {
                     for (int j = from; j < to; j++) {
                         var e  = entries.get(j);
