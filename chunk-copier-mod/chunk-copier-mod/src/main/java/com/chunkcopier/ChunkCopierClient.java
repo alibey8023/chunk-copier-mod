@@ -14,12 +14,10 @@ import net.minecraft.server.integrated.IntegratedServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
-import net.minecraft.util.WorldSavePath;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.WorldChunk;
-import net.minecraft.world.level.storage.LevelStorage;
 import org.lwjgl.glfw.GLFW;
 
 import java.io.File;
@@ -200,11 +198,12 @@ public class ChunkCopierClient implements ClientModInitializer {
     }
 
     private void openOrCreateWorld(MinecraftClient client) {
-        LevelStorage storage = client.getLevelStorage();
-
-        // Her zaman session aç ve level.dat'ı yeniden yaz — bozuk eski dosyaları düzeltir
-        try (LevelStorage.Session session = storage.createSession(WORLD_NAME)) {
-            writeFlatLevelDat(session);
+        // Doğrudan saves/ChunkCopierExport/level.dat yaz — LevelStorage.Session kullanma
+        // createSession() eski bozuk klasör varken exception fırlatıyor, bu yöntem her zaman çalışır
+        Path worldDir = client.runDirectory.toPath().resolve("saves").resolve(WORLD_NAME);
+        try {
+            java.nio.file.Files.createDirectories(worldDir);
+            writeFlatLevelDatDirect(worldDir.resolve("level.dat"));
             client.execute(() -> localMsg(client, "§7'ChunkCopierExport' hazırlandı."));
         } catch (Exception e) {
             client.execute(() -> localMsg(client, "§cDünya oluşturulamadı: " + e.getMessage()));
@@ -217,7 +216,7 @@ public class ChunkCopierClient implements ClientModInitializer {
         });
     }
 
-    private void writeFlatLevelDat(LevelStorage.Session session) throws IOException {
+    private void writeFlatLevelDatDirect(Path levelDat) throws IOException {
         NbtCompound root = new NbtCompound();
         NbtCompound d    = new NbtCompound();
 
@@ -285,7 +284,7 @@ public class ChunkCopierClient implements ClientModInitializer {
         d.put("WorldGenSettings", wgs);
 
         root.put("Data", d);
-        NbtIo.writeCompressed(root, session.getDirectory(WorldSavePath.ROOT).resolve("level.dat"));
+        NbtIo.writeCompressed(root, levelDat);
     }
 
     private static NbtCompound layer(String block, int height) {
