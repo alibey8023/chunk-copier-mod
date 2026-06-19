@@ -180,24 +180,9 @@ public class ChunkCopierClient implements ClientModInitializer {
         scanner.start();
     }
 
-    // Oyuncunun hangi yönde gitmesi gerektiğine dair ipucu
+    // Sağ/sol/ileri/geri yön ipucu
     private String directionHint(MinecraftClient client, ChunkPos center) {
-        if (client.player == null) return "";
-        float yaw = client.player.getYaw() % 360;
-        if (yaw < 0) yaw += 360;
-
-        // Yön önerileri
-        String goDir;
-        if      (yaw <  45 || yaw >= 315) goDir = "güney";
-        else if (yaw <  90)               goDir = "güneybatı";
-        else if (yaw < 135)               goDir = "batı";
-        else if (yaw < 180)               goDir = "kuzeybatı";
-        else if (yaw < 225)               goDir = "kuzey";
-        else if (yaw < 270)               goDir = "kuzeydoğu";
-        else if (yaw < 315)               goDir = "doğu";
-        else                              goDir = "güneydoğu";
-
-        return " — devam et ya da §e" + goDir + "§7ya git";
+        return " — §edevam et §7ya da §eyana git §7(G = durdur)";
     }
 
     private void savePending(MinecraftClient client) {
@@ -217,17 +202,13 @@ public class ChunkCopierClient implements ClientModInitializer {
     private void openOrCreateWorld(MinecraftClient client) {
         LevelStorage storage = client.getLevelStorage();
 
-        boolean exists = false;
-        try { exists = storage.levelExists(WORLD_NAME); } catch (Exception ignored) {}
-
-        if (!exists) {
-            try (LevelStorage.Session session = storage.createSession(WORLD_NAME)) {
-                writeFlatLevelDat(session);
-                client.execute(() -> localMsg(client, "§7'ChunkCopierExport' oluşturuldu."));
-            } catch (Exception e) {
-                client.execute(() -> localMsg(client, "§cDünya oluşturulamadı: " + e.getMessage()));
-                return;
-            }
+        // Her zaman session aç ve level.dat'ı yeniden yaz — bozuk eski dosyaları düzeltir
+        try (LevelStorage.Session session = storage.createSession(WORLD_NAME)) {
+            writeFlatLevelDat(session);
+            client.execute(() -> localMsg(client, "§7'ChunkCopierExport' hazırlandı."));
+        } catch (Exception e) {
+            client.execute(() -> localMsg(client, "§cDünya oluşturulamadı: " + e.getMessage()));
+            return;
         }
 
         client.execute(() -> {
