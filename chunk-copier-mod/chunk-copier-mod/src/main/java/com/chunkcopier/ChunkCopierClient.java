@@ -8,7 +8,6 @@ import net.minecraft.block.Block;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
-import net.minecraft.client.gui.screen.world.SelectWorldScreen;
 import net.minecraft.nbt.*;
 import net.minecraft.registry.Registries;
 import net.minecraft.server.integrated.IntegratedServer;
@@ -23,33 +22,51 @@ import org.lwjgl.glfw.GLFW;
 
 import java.io.File;
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
+/**
+ * Chunk Copier — simplified, crash-free flow:
+ *
+ *  1) Source world  : press G → walk around → press G again → blocks saved to disk
+ *  2) Destination   : open ANY singleplayer world you created → blocks paste automatically,
+ *                     chunk by chunk (small batches per tick, no lag / freeze)
+ *
+ * No automatic world creation, no disconnect calls → no crashes.
+ */
 public class ChunkCopierClient implements ClientModInitializer {
 
-    private enum State { IDLE, RECORDING, PENDING_PASTE }
-    private State state = State.IDLE;
+    // ── State ─────────────────────────────────────────────────────────────────
+
+    private enum RecordState { IDLE, RECORDING }
+    private RecordState recordState = RecordState.IDLE;
 
     private final Map<String, String> copiedBlocks = new ConcurrentHashMap<>();
-    private final Set<Long> scannedChunks = ConcurrentHashMap.newKeySet();
-    private final Queue<WorldChunk> scanQueue = new ArrayDeque<>();
+    private final Set<Long>           scannedChunks = ConcurrentHashMap.newKeySet();
+    private final Queue<WorldChunk>   scanQueue     = new ArrayDeque<>();
     private int refX = 0, refZ = 0;
+
+    // Paste state — lives across world loads
+    private List<Map.Entry<String, String>> pasteList    = null;
+    private int                              pasteIndex   = 0;
+    private int                              pasteOriginX = 0;
+    private int                              pasteOriginZ = 0;
+    private final AtomicInteger              pasteCount   = new AtomicInteger(0);
 
     private static KeyBinding gKey;
     private boolean keyWasDown = false;
-    private int scanTick = 0;
+    private int     scanTick   = 0;
 
-    // Per-tick time budget for chunk scanning (2 ms out of 50 ms tick = 4%)
-    // This prevents "Not Responding" freezes and FPS drops.
+    /** Blocks pasted per tick during paste phase. Keep low to avoid TPS/FPS hitches. */
+    private static final int  PASTE_PER_TICK = 50;
+    /** Max nanoseconds spent scanning per tick (2 ms = 4 % of a 50 ms tick). */
     private static final long SCAN_BUDGET_NS = 2_000_000L;
 
-    private static final int    DATA_VERSION = 4189;
     private static final String PENDING_FILE = "chunk_copier_pending.nbt";
-    private static final String WORLD_NAME   = "ChunkCopierExport";
+
+    // ── Init ──────────────────────────────────────────────────────────────────
 
     @Override
     public void onInitializeClient() {
@@ -59,69 +76,79 @@ public class ChunkCopierClient implements ClientModInitializer {
                 GLFW.GLFW_KEY_G,
                 "category.chunkcopier"
         ));
+
         ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
-        ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
-            Thread t = new Thread(() -> {
-                try { Thread.sleep(3000); } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt(); return;
-                }
-                client.execute(() -> tryPastePending(client));
-            });
-            t.setDaemon(true);
-            t.start();
-        });
+
+        // When joining ANY singleplayer world: load pending.nbt and start pasting
+        ClientPlayConnectionEvents.JOIN.register((handler, sender, client) ->
+            client.execute(() -> loadPendingAndStartPaste(client))
+        );
     }
 
-    // ── Tick ─────────────────────────────────────────────────────────────────
+    // ── Tick ──────────────────────────────────────────────────────────────────
 
     private void onTick(MinecraftClient client) {
+        // Key edge detection
         boolean isDown = gKey.isPressed();
         if (isDown && !keyWasDown) handleG(client);
         keyWasDown = isDown;
 
-        if (state == State.RECORDING) {
+        // Chunk scanning (main thread, time-budgeted)
+        if (recordState == RecordState.RECORDING) {
             if (++scanTick >= 60) { scanTick = 0; enqueueNewChunks(client); }
             drainScanQueue(client);
         }
+
+        // Incremental paste — one small batch per tick
+        if (pasteList != null && !pasteList.isEmpty()) {
+            tickPaste(client);
+        }
     }
+
+    // ── G key handler ─────────────────────────────────────────────────────────
 
     private void handleG(MinecraftClient client) {
         if (client.player == null || client.world == null) return;
-        switch (state) {
+
+        switch (recordState) {
             case IDLE -> {
                 copiedBlocks.clear();
                 scannedChunks.clear();
                 scanQueue.clear();
-                scanTick = 60;
+                scanTick = 60; // trigger immediate enqueue next tick
                 ChunkPos start = new ChunkPos(client.player.getBlockPos());
                 refX = start.getStartX();
                 refZ = start.getStartZ();
-                state = State.RECORDING;
-                localMsg(client, "§a● §fKayıt başladı — etrafı gez. G = durdur.");
+                recordState = RecordState.RECORDING;
+                localMsg(client, "§a● §fKayıt başladı — etrafı gez, chunk'lar kopyalanıyor.");
+                localMsg(client, "§7G'ye tekrar bas → kaydı bitir ve diske kaydet.");
             }
             case RECORDING -> {
-                state = State.PENDING_PASTE;
+                recordState = RecordState.IDLE;
                 scanQueue.clear();
                 if (copiedBlocks.isEmpty()) {
-                    localMsg(client, "§cHiç blok bulunamadı, tekrar dene.");
-                    state = State.IDLE;
+                    localMsg(client, "§cHiç blok bulunamadı — tekrar dene.");
                     return;
                 }
-                localMsg(client, "§a✔ §f" + copiedBlocks.size() + " blok / "
-                        + scannedChunks.size() + " chunk — dünya hazırlanıyor...");
+                int count = copiedBlocks.size();
+                int chunks = scannedChunks.size();
+                // Save to disk in background (NBT I/O, doesn't touch game state)
+                Map<String, String> snapshot = new HashMap<>(copiedBlocks);
+                int snapRefX = refX, snapRefZ = refZ;
                 Thread t = new Thread(() -> {
-                    savePending(client);
-                    prepareAndOpenExportWorld(client);
+                    savePending(client, snapshot, snapRefX, snapRefZ);
+                    client.execute(() -> {
+                        localMsg(client, "§a✔ §f" + count + " blok / " + chunks + " chunk kaydedildi.");
+                        localMsg(client, "§e→ §fBoş bir dünyaya gir → bloklar otomatik yapıştırılacak.");
+                    });
                 });
                 t.setDaemon(true);
                 t.start();
             }
-            case PENDING_PASTE ->
-                localMsg(client, "§6Zaten bekleyen yapıştırma var — ChunkCopierExport dünyasına geçiliyor...");
         }
     }
 
-    // ── Chunk scanning (main thread, time-budgeted) ───────────────────────────
+    // ── Chunk scanning ────────────────────────────────────────────────────────
 
     private void enqueueNewChunks(MinecraftClient client) {
         if (client.player == null || client.world == null) return;
@@ -139,8 +166,8 @@ public class ChunkCopierClient implements ClientModInitializer {
     }
 
     /**
-     * Reads blocks from queued chunks on the MAIN THREAD with a strict time budget.
-     * Stays within SCAN_BUDGET_NS per tick so the game never freezes or drops frames.
+     * Reads chunk block states on the MAIN THREAD with a strict nanosecond budget.
+     * Never spends more than SCAN_BUDGET_NS (2 ms) per tick → no freezes, no FPS loss.
      */
     private void drainScanQueue(MinecraftClient client) {
         if (client.world == null || scanQueue.isEmpty()) return;
@@ -148,7 +175,7 @@ public class ChunkCopierClient implements ClientModInitializer {
         int maxY = client.world.getBottomY() + client.world.getHeight();
 
         long deadline = System.nanoTime() + SCAN_BUDGET_NS;
-        boolean reported = false;
+        boolean didWork = false;
 
         outer:
         while (!scanQueue.isEmpty()) {
@@ -166,237 +193,110 @@ public class ChunkCopierClient implements ClientModInitializer {
                                 Registries.BLOCK.getId(bs.getBlock()).toString()
                             );
                         }
-                        // Check budget every 256 blocks to reduce nanoTime() overhead
+                        // Check budget every 256 iterations (reduces nanoTime overhead)
                         if ((y & 0xFF) == 0 && System.nanoTime() >= deadline) break outer;
                     }
                 }
             }
-            scanQueue.poll(); // fully processed
-            reported = true;
+            scanQueue.poll(); // finished this chunk
+            didWork = true;
             if (System.nanoTime() >= deadline) break;
         }
 
-        if (reported) {
+        if (didWork) {
             localMsg(client, "§7[CC] §f" + copiedBlocks.size() + " blok / "
                     + scannedChunks.size() + " chunk — kuyruk: " + scanQueue.size()
-                    + " §e(G = durdur)");
+                    + " §7| G = durdur");
         }
     }
 
-    // ── Save + world creation ─────────────────────────────────────────────────
+    // ── NBT I/O ───────────────────────────────────────────────────────────────
 
-    private void savePending(MinecraftClient client) {
-        NbtCompound nbt    = new NbtCompound();
-        NbtCompound blocks = new NbtCompound();
-        nbt.putInt("refX", refX);
-        nbt.putInt("refZ", refZ);
-        for (var e : copiedBlocks.entrySet()) blocks.putString(e.getKey(), e.getValue());
-        nbt.put("blocks", blocks);
+    private void savePending(MinecraftClient client, Map<String, String> blocks,
+                             int originX, int originZ) {
+        NbtCompound nbt   = new NbtCompound();
+        NbtCompound bNbt  = new NbtCompound();
+        nbt.putInt("refX", originX);
+        nbt.putInt("refZ", originZ);
+        for (var e : blocks.entrySet()) bNbt.putString(e.getKey(), e.getValue());
+        nbt.put("blocks", bNbt);
         try {
             NbtIo.write(nbt, getPendingPath(client));
         } catch (IOException e) {
-            client.execute(() -> localMsg(client, "§cDosya kaydedilemedi: " + e.getMessage()));
+            client.execute(() -> localMsg(client, "§cKayıt hatası: " + e.getMessage()));
         }
     }
 
-    /**
-     * Creates the export world and then automatically switches the client to it.
-     * After world creation the client disconnects from the current world and
-     * opens the world selection screen with ChunkCopierExport at the top.
-     */
-    private void prepareAndOpenExportWorld(MinecraftClient client) {
-        Path savesDir = client.runDirectory.toPath().resolve("saves");
-        Path worldDir = savesDir.resolve(WORLD_NAME);
-
-        deleteDirectory(worldDir.toFile());
-        try {
-            Files.createDirectories(worldDir);
-            writeLevelDat(worldDir.resolve("level.dat"));
-        } catch (Exception e) {
-            client.execute(() -> localMsg(client, "§cDünya oluşturulamadı: " + e.getMessage()));
-            return;
-        }
-
-        // Switch to the new world on the main thread.
-        // Disconnect → open SelectWorldScreen (ChunkCopierExport will be first in the list).
-        client.execute(() -> {
-            if (client.world != null) {
-                // Gracefully disconnect from current session
-                client.world.disconnect();
-            }
-            client.setScreen(new SelectWorldScreen(null));
-            localMsg(client, "§a✔ §f'ChunkCopierExport' hazır — dünya listesi açıldı, üstüne çift tıkla!");
-        });
-    }
-
-    // ── level.dat for Minecraft 1.21.4 ───────────────────────────────────────
-
-    private void writeLevelDat(Path path) throws IOException {
-        NbtCompound root = new NbtCompound();
-        root.putInt("DataVersion", DATA_VERSION);
-
-        NbtCompound data = new NbtCompound();
-        data.putInt("DataVersion", DATA_VERSION);
-        data.putString("LevelName", WORLD_NAME);
-        data.putInt("GameType", 1);
-        data.putByte("Difficulty", (byte) 1);
-        data.putByte("allowCommands", (byte) 1);
-        data.putByte("hardcore", (byte) 0);
-        data.putLong("RandomSeed", 0L);
-        data.putLong("LastPlayed", System.currentTimeMillis());
-        data.putInt("SpawnX", 0);
-        data.putInt("SpawnY", 65);
-        data.putInt("SpawnZ", 0);
-        data.putFloat("SpawnAngle", 0f);
-        data.putLong("Time", 0L);
-        data.putLong("DayTime", 6000L);
-        data.putByte("initialized", (byte) 1);
-
-        NbtCompound version = new NbtCompound();
-        version.putInt("Id", DATA_VERSION);
-        version.putString("Name", "1.21.4");
-        version.putString("Series", "main");
-        version.putByte("Snapshot", (byte) 0);
-        data.put("Version", version);
-
-        NbtCompound gameRules = new NbtCompound();
-        gameRules.putString("doMobSpawning", "false");
-        gameRules.putString("doDaylightCycle", "false");
-        gameRules.putString("doWeatherCycle", "false");
-        gameRules.putString("keepInventory", "true");
-        data.put("GameRules", gameRules);
-
-        // WorldGenSettings — void flat (safest, no terrain generation)
-        NbtCompound wgs = new NbtCompound();
-        wgs.putLong("seed", 0L);
-        wgs.putByte("generate_features", (byte) 0);
-        wgs.putByte("bonus_chest", (byte) 0);
-
-        NbtCompound dims = new NbtCompound();
-
-        // Overworld: flat/void — one bedrock layer, no terrain
-        NbtCompound ow = new NbtCompound();
-        ow.putString("type", "minecraft:overworld");
-        NbtCompound flatGen = new NbtCompound();
-        flatGen.putString("type", "minecraft:flat");
-        NbtCompound flatSettings = new NbtCompound();
-        flatSettings.putString("biome", "minecraft:the_void");
-        flatSettings.putByte("lakes", (byte) 0);
-        flatSettings.putByte("features", (byte) 0);
-        flatSettings.put("structure_overrides", new NbtList());
-        NbtList layers = new NbtList();
-        NbtCompound bedrock = new NbtCompound();
-        bedrock.putString("block", "minecraft:bedrock");
-        bedrock.putInt("height", 1);
-        layers.add(bedrock);
-        flatSettings.put("layers", layers);
-        flatGen.put("settings", flatSettings);
-        ow.put("generator", flatGen);
-        dims.put("minecraft:overworld", ow);
-
-        // Nether
-        NbtCompound nether = new NbtCompound();
-        nether.putString("type", "minecraft:the_nether");
-        NbtCompound netherGen = new NbtCompound();
-        netherGen.putString("type", "minecraft:noise");
-        netherGen.putString("settings", "minecraft:nether");
-        NbtCompound netherBiome = new NbtCompound();
-        netherBiome.putString("type", "minecraft:multi_noise");
-        netherBiome.putString("preset", "minecraft:nether");
-        netherGen.put("biome_source", netherBiome);
-        nether.put("generator", netherGen);
-        dims.put("minecraft:the_nether", nether);
-
-        // End
-        NbtCompound end = new NbtCompound();
-        end.putString("type", "minecraft:the_end");
-        NbtCompound endGen = new NbtCompound();
-        endGen.putString("type", "minecraft:noise");
-        endGen.putString("settings", "minecraft:end");
-        NbtCompound endBiome = new NbtCompound();
-        endBiome.putString("type", "minecraft:the_end");
-        endGen.put("biome_source", endBiome);
-        end.put("generator", endGen);
-        dims.put("minecraft:the_end", end);
-
-        wgs.put("dimensions", dims);
-        data.put("WorldGenSettings", wgs);
-
-        root.put("Data", data);
-        NbtIo.writeCompressed(root, path);
-    }
-
-    // ── Paste on JOIN ─────────────────────────────────────────────────────────
-
-    private void tryPastePending(MinecraftClient client) {
+    private void loadPendingAndStartPaste(MinecraftClient client) {
+        // Only paste into singleplayer worlds (integrated server present)
         IntegratedServer server = client.getServer();
         if (server == null || client.player == null) return;
 
-        Path savePath = getPendingPath(client);
-        File saveFile = savePath.toFile();
+        File saveFile = getPendingPath(client).toFile();
         if (!saveFile.exists()) return;
 
         NbtCompound nbt;
-        try { nbt = NbtIo.read(savePath); }
-        catch (IOException e) { localMsg(client, "§cChunk okunamadı: " + e.getMessage()); return; }
+        try { nbt = NbtIo.read(getPendingPath(client)); }
+        catch (IOException e) { localMsg(client, "§cPending okunamadı: " + e.getMessage()); return; }
         if (nbt == null) return;
 
-        int originX = nbt.getInt("refX");
-        int originZ = nbt.getInt("refZ");
-        NbtCompound blocks = nbt.getCompound("blocks");
+        NbtCompound bNbt = nbt.getCompound("blocks");
+        if (bNbt.isEmpty()) { saveFile.delete(); return; }
+
+        pasteOriginX = nbt.getInt("refX");
+        pasteOriginZ = nbt.getInt("refZ");
+        pasteList    = new ArrayList<>(bNbt.getKeys().stream()
+                .map(k -> Map.entry(k, bNbt.getString(k))).toList());
+        pasteIndex   = 0;
+        pasteCount.set(0);
+
+        localMsg(client, "§eYapıştırılıyor: §f" + pasteList.size()
+                + " blok (her tick " + PASTE_PER_TICK + " blok)...");
+    }
+
+    // ── Incremental paste (called every tick) ─────────────────────────────────
+
+    private void tickPaste(MinecraftClient client) {
+        IntegratedServer server = client.getServer();
+        if (server == null || client.player == null) return;
 
         ServerWorld sw = server.getWorld(World.OVERWORLD);
-        if (sw == null) { localMsg(client, "§cOverworld bulunamadı."); return; }
+        if (sw == null) return;
 
-        localMsg(client, "§eYapıştırılıyor: §f" + blocks.getKeys().size() + " blok...");
-
-        AtomicInteger pasted = new AtomicInteger(0);
-        Thread t = new Thread(() -> {
-            List<Map.Entry<String, String>> entries = new ArrayList<>(
-                    blocks.getKeys().stream().map(k -> Map.entry(k, blocks.getString(k))).toList());
-
-            for (int i = 0; i < entries.size(); i += 500) {
-                int from = i, to = Math.min(i + 500, entries.size());
-                client.execute(() -> {
-                    for (int j = from; j < to; j++) {
-                        var e  = entries.get(j);
-                        String[] p = e.getKey().split(",");
-                        int relX = Integer.parseInt(p[0]);
-                        int y    = Integer.parseInt(p[1]);
-                        int relZ = Integer.parseInt(p[2]);
-                        Identifier id = Identifier.of(e.getValue());
-                        if (Registries.BLOCK.containsId(id)) {
-                            Block block = Registries.BLOCK.get(id);
-                            sw.setBlockState(
-                                    new BlockPos(originX + relX, y, originZ + relZ),
-                                    block.getDefaultState(), 3);
-                            pasted.incrementAndGet();
-                        }
-                    }
-                });
-                try { Thread.sleep(50); } catch (InterruptedException ex) { break; }
+        int end = Math.min(pasteIndex + PASTE_PER_TICK, pasteList.size());
+        for (int i = pasteIndex; i < end; i++) {
+            var e = pasteList.get(i);
+            String[] p = e.getKey().split(",");
+            int relX = Integer.parseInt(p[0]);
+            int y    = Integer.parseInt(p[1]);
+            int relZ = Integer.parseInt(p[2]);
+            Identifier id = Identifier.of(e.getValue());
+            if (Registries.BLOCK.containsId(id)) {
+                Block block = Registries.BLOCK.get(id);
+                sw.setBlockState(
+                        new BlockPos(pasteOriginX + relX, y, pasteOriginZ + relZ),
+                        block.getDefaultState(), 3);
+                pasteCount.incrementAndGet();
             }
+        }
+        pasteIndex = end;
 
-            client.execute(() -> {
-                saveFile.delete();
-                state = State.IDLE;
-                localMsg(client, "§a✔ §fTamamlandı! §e" + pasted.get() + " §fblok yapıştırıldı.");
-            });
-        });
-        t.setDaemon(true);
-        t.start();
+        // Progress message every 5000 blocks
+        if (pasteIndex % 5000 < PASTE_PER_TICK) {
+            localMsg(client, "§7[CC] §eYapıştırılıyor... §f"
+                    + pasteIndex + " / " + pasteList.size());
+        }
+
+        if (pasteIndex >= pasteList.size()) {
+            // Done — clean up
+            getPendingPath(client).toFile().delete();
+            localMsg(client, "§a✔ §fTamamlandı! §e" + pasteCount.get() + " §fblok yapıştırıldı.");
+            pasteList  = null;
+            pasteIndex = 0;
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
-
-    private void deleteDirectory(File dir) {
-        if (dir == null || !dir.exists()) return;
-        File[] files = dir.listFiles();
-        if (files != null) for (File f : files) {
-            if (f.isDirectory()) deleteDirectory(f); else f.delete();
-        }
-        dir.delete();
-    }
 
     private Path getPendingPath(MinecraftClient client) {
         return client.runDirectory.toPath().resolve(PENDING_FILE);
