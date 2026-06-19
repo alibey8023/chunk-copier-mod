@@ -15,11 +15,9 @@ jobs:
       - uses: gradle/actions/setup-gradle@v3
       - name: Derle
         run: |
-          BUILD_DIR=$(find . -name "build.gradle" | head -1 | xargs dirname)
-          echo "Build klasoru: $BUILD_DIR"
-          cd "$BUILD_DIR"
+          cd $(find . -name "settings.gradle" | head -1 | xargs dirname)
           gradle build --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: chunk-copier-mod
-          path: "**/build/libs/chunk-copier-*.jar"
+          path: "**/build/libs/*.jar"
