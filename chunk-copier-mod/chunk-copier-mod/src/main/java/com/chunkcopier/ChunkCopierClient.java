@@ -27,42 +27,46 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * Chunk Copier — simplified, crash-free flow:
- *
- *  1) Source world  : press G → walk around → press G again → blocks saved to disk
- *  2) Destination   : open ANY singleplayer world you created → blocks paste automatically,
- *                     chunk by chunk (small batches per tick, no lag / freeze)
- *
- * No automatic world creation, no disconnect calls → no crashes.
- */
 public class ChunkCopierClient implements ClientModInitializer {
 
-    // ── State ─────────────────────────────────────────────────────────────────
+    // ── Recording state ───────────────────────────────────────────────────────
 
     private enum RecordState { IDLE, RECORDING }
     private RecordState recordState = RecordState.IDLE;
 
-    private final Map<String, String> copiedBlocks = new ConcurrentHashMap<>();
+    private final Map<String, String> copiedBlocks  = new ConcurrentHashMap<>();
     private final Set<Long>           scannedChunks = ConcurrentHashMap.newKeySet();
     private final Queue<WorldChunk>   scanQueue     = new ArrayDeque<>();
     private int refX = 0, refZ = 0;
 
-    // Paste state — lives across world loads
+    // Per-chunk scan cursor — remembers where we left off inside a chunk
+    // so we never restart from lx=0,lz=0,y=minY after a budget cut.
+    private WorldChunk activeScanChunk = null;
+    private int        scanLx = 0, scanLz = 0, scanY = 0;
+    private int        scanMinY = 0, scanMaxY = 0;
+
+    // ── Paste state ───────────────────────────────────────────────────────────
+
     private List<Map.Entry<String, String>> pasteList    = null;
     private int                              pasteIndex   = 0;
     private int                              pasteOriginX = 0;
     private int                              pasteOriginZ = 0;
     private final AtomicInteger              pasteCount   = new AtomicInteger(0);
 
+    // ── Key / tick ────────────────────────────────────────────────────────────
+
     private static KeyBinding gKey;
     private boolean keyWasDown = false;
-    private int     scanTick   = 0;
 
-    /** Blocks pasted per tick during paste phase. Keep low to avoid TPS/FPS hitches. */
-    private static final int  PASTE_PER_TICK = 50;
-    /** Max nanoseconds spent scanning per tick (2 ms = 4 % of a 50 ms tick). */
-    private static final long SCAN_BUDGET_NS = 2_000_000L;
+    /** Ticks between chunk-discovery sweeps (60 = every 3 s). */
+    private int enqueueTimer = 0;
+    /** Ticks between status messages (100 = every 5 s). */
+    private int logTimer = 0;
+
+    /** Max nanoseconds spent scanning per tick (3 ms = 6 % of a 50 ms tick). */
+    private static final long SCAN_BUDGET_NS = 3_000_000L;
+    /** Blocks pasted per tick — small enough that the server never hiccups. */
+    private static final int  PASTE_PER_TICK = 64;
 
     private static final String PENDING_FILE = "chunk_copier_pending.nbt";
 
@@ -76,10 +80,7 @@ public class ChunkCopierClient implements ClientModInitializer {
                 GLFW.GLFW_KEY_G,
                 "category.chunkcopier"
         ));
-
         ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
-
-        // When joining ANY singleplayer world: load pending.nbt and start pasting
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) ->
             client.execute(() -> loadPendingAndStartPaste(client))
         );
@@ -88,67 +89,71 @@ public class ChunkCopierClient implements ClientModInitializer {
     // ── Tick ──────────────────────────────────────────────────────────────────
 
     private void onTick(MinecraftClient client) {
-        // Key edge detection
         boolean isDown = gKey.isPressed();
         if (isDown && !keyWasDown) handleG(client);
         keyWasDown = isDown;
 
-        // Chunk scanning (main thread, time-budgeted)
         if (recordState == RecordState.RECORDING) {
-            if (++scanTick >= 60) { scanTick = 0; enqueueNewChunks(client); }
+            // Discover new visible chunks periodically
+            if (++enqueueTimer >= 60) { enqueueTimer = 0; enqueueNewChunks(client); }
+            // Continue scanning from where we left off
             drainScanQueue(client);
+            // Status log every 5 seconds
+            if (++logTimer >= 100 && client.player != null) {
+                logTimer = 0;
+                int queued = scanQueue.size() + (activeScanChunk != null ? 1 : 0);
+                localMsg(client, "§7[CC] §f" + copiedBlocks.size() + " blok, "
+                        + scannedChunks.size() + " chunk — kopyalanıyor"
+                        + (queued > 0 ? " (§e" + queued + " chunk§7 kuyrukta)" : " §a✔")
+                        + " §7| G = bitir");
+            }
         }
 
-        // Incremental paste — one small batch per tick
-        if (pasteList != null && !pasteList.isEmpty()) {
-            tickPaste(client);
-        }
+        if (pasteList != null) tickPaste(client);
     }
 
-    // ── G key handler ─────────────────────────────────────────────────────────
+    // ── G key ─────────────────────────────────────────────────────────────────
 
     private void handleG(MinecraftClient client) {
         if (client.player == null || client.world == null) return;
-
         switch (recordState) {
             case IDLE -> {
                 copiedBlocks.clear();
                 scannedChunks.clear();
                 scanQueue.clear();
-                scanTick = 60; // trigger immediate enqueue next tick
+                activeScanChunk = null;
+                enqueueTimer = 60; // trigger immediate discovery
+                logTimer = 0;
                 ChunkPos start = new ChunkPos(client.player.getBlockPos());
                 refX = start.getStartX();
                 refZ = start.getStartZ();
                 recordState = RecordState.RECORDING;
-                localMsg(client, "§a● §fKayıt başladı — etrafı gez, chunk'lar kopyalanıyor.");
-                localMsg(client, "§7G'ye tekrar bas → kaydı bitir ve diske kaydet.");
+                localMsg(client, "§a● §fKayıt başladı — etrafı gez. §7G = durdur.");
             }
             case RECORDING -> {
                 recordState = RecordState.IDLE;
                 scanQueue.clear();
+                activeScanChunk = null;
                 if (copiedBlocks.isEmpty()) {
-                    localMsg(client, "§cHiç blok bulunamadı — tekrar dene.");
-                    return;
+                    localMsg(client, "§cHiç blok bulunamadı, tekrar dene."); return;
                 }
-                int count = copiedBlocks.size();
+                int count  = copiedBlocks.size();
                 int chunks = scannedChunks.size();
-                // Save to disk in background (NBT I/O, doesn't touch game state)
                 Map<String, String> snapshot = new HashMap<>(copiedBlocks);
-                int snapRefX = refX, snapRefZ = refZ;
-                Thread t = new Thread(() -> {
-                    savePending(client, snapshot, snapRefX, snapRefZ);
+                int sx = refX, sz = refZ;
+                new Thread(() -> {
+                    savePending(client, snapshot, sx, sz);
                     client.execute(() -> {
-                        localMsg(client, "§a✔ §f" + count + " blok / " + chunks + " chunk kaydedildi.");
-                        localMsg(client, "§e→ §fBoş bir dünyaya gir → bloklar otomatik yapıştırılacak.");
+                        localMsg(client, "§a✔ §f" + count + " blok / " + chunks
+                                + " chunk kaydedildi.");
+                        localMsg(client, "§e→ §fBoş dünyana gir, bloklar otomatik yapıştırılır.");
                     });
-                });
-                t.setDaemon(true);
-                t.start();
+                }, "cc-save").start();
             }
         }
     }
 
-    // ── Chunk scanning ────────────────────────────────────────────────────────
+    // ── Chunk discovery ───────────────────────────────────────────────────────
 
     private void enqueueNewChunks(MinecraftClient client) {
         if (client.player == null || client.world == null) return;
@@ -165,48 +170,60 @@ public class ChunkCopierClient implements ClientModInitializer {
         }
     }
 
-    /**
-     * Reads chunk block states on the MAIN THREAD with a strict nanosecond budget.
-     * Never spends more than SCAN_BUDGET_NS (2 ms) per tick → no freezes, no FPS loss.
-     */
+    // ── Chunk scanning — time-budgeted, continues across ticks ───────────────
+    //
+    // KEY FIX: we store (activeScanChunk, scanLx, scanLz, scanY) so each tick
+    // we resume exactly where the budget cut us off.  Previously the code used
+    // peek() + restart-from-zero each tick, so large chunks were never fully read.
+
     private void drainScanQueue(MinecraftClient client) {
-        if (client.world == null || scanQueue.isEmpty()) return;
-        int minY = client.world.getBottomY();
-        int maxY = client.world.getBottomY() + client.world.getHeight();
+        if (client.world == null) return;
 
-        long deadline = System.nanoTime() + SCAN_BUDGET_NS;
-        boolean didWork = false;
-
-        outer:
-        while (!scanQueue.isEmpty()) {
-            WorldChunk chunk = scanQueue.peek();
-            ChunkPos cp = chunk.getPos();
-            for (int lx = 0; lx < 16; lx++) {
-                for (int lz = 0; lz < 16; lz++) {
-                    int wx = cp.getStartX() + lx;
-                    int wz = cp.getStartZ() + lz;
-                    for (int y = minY; y < maxY; y++) {
-                        var bs = chunk.getBlockState(new BlockPos(wx, y, wz));
-                        if (!bs.isAir()) {
-                            copiedBlocks.put(
-                                (wx - refX) + "," + y + "," + (wz - refZ),
-                                Registries.BLOCK.getId(bs.getBlock()).toString()
-                            );
-                        }
-                        // Check budget every 256 iterations (reduces nanoTime overhead)
-                        if ((y & 0xFF) == 0 && System.nanoTime() >= deadline) break outer;
-                    }
-                }
-            }
-            scanQueue.poll(); // finished this chunk
-            didWork = true;
-            if (System.nanoTime() >= deadline) break;
+        // Pick up a new chunk from the queue if we don't have one in progress
+        if (activeScanChunk == null) {
+            if (scanQueue.isEmpty()) return;
+            activeScanChunk = scanQueue.poll();
+            scanLx   = 0;
+            scanLz   = 0;
+            scanMinY = client.world.getBottomY();
+            scanMaxY = client.world.getBottomY() + client.world.getHeight();
+            scanY    = scanMinY;
         }
 
-        if (didWork) {
-            localMsg(client, "§7[CC] §f" + copiedBlocks.size() + " blok / "
-                    + scannedChunks.size() + " chunk — kuyruk: " + scanQueue.size()
-                    + " §7| G = durdur");
+        long deadline = System.nanoTime() + SCAN_BUDGET_NS;
+        ChunkPos cp = activeScanChunk.getPos();
+
+        scan:
+        while (true) {
+            int wx = cp.getStartX() + scanLx;
+            int wz = cp.getStartZ() + scanLz;
+
+            while (scanY < scanMaxY) {
+                var bs = activeScanChunk.getBlockState(new BlockPos(wx, scanY, wz));
+                if (!bs.isAir()) {
+                    copiedBlocks.put(
+                        (wx - refX) + "," + scanY + "," + (wz - refZ),
+                        Registries.BLOCK.getId(bs.getBlock()).toString()
+                    );
+                }
+                scanY++;
+                // Budget check every 256 Y levels to reduce nanoTime() calls
+                if ((scanY & 0xFF) == 0 && System.nanoTime() >= deadline) break scan;
+            }
+
+            // Column done — advance to next column
+            scanY = scanMinY;
+            scanLz++;
+            if (scanLz >= 16) { scanLz = 0; scanLx++; }
+            if (scanLx >= 16) {
+                // Chunk fully scanned
+                activeScanChunk = null;
+                // Start next chunk if budget remains
+                if (scanQueue.isEmpty() || System.nanoTime() >= deadline) break scan;
+                activeScanChunk = scanQueue.poll();
+                cp = activeScanChunk.getPos();
+                scanLx = 0; scanLz = 0; scanY = scanMinY;
+            }
         }
     }
 
@@ -214,8 +231,8 @@ public class ChunkCopierClient implements ClientModInitializer {
 
     private void savePending(MinecraftClient client, Map<String, String> blocks,
                              int originX, int originZ) {
-        NbtCompound nbt   = new NbtCompound();
-        NbtCompound bNbt  = new NbtCompound();
+        NbtCompound nbt  = new NbtCompound();
+        NbtCompound bNbt = new NbtCompound();
         nbt.putInt("refX", originX);
         nbt.putInt("refZ", originZ);
         for (var e : blocks.entrySet()) bNbt.putString(e.getKey(), e.getValue());
@@ -228,38 +245,31 @@ public class ChunkCopierClient implements ClientModInitializer {
     }
 
     private void loadPendingAndStartPaste(MinecraftClient client) {
-        // Only paste into singleplayer worlds (integrated server present)
-        IntegratedServer server = client.getServer();
-        if (server == null || client.player == null) return;
-
-        File saveFile = getPendingPath(client).toFile();
-        if (!saveFile.exists()) return;
-
+        if (client.getServer() == null || client.player == null) return;
+        File f = getPendingPath(client).toFile();
+        if (!f.exists()) return;
         NbtCompound nbt;
         try { nbt = NbtIo.read(getPendingPath(client)); }
         catch (IOException e) { localMsg(client, "§cPending okunamadı: " + e.getMessage()); return; }
         if (nbt == null) return;
-
         NbtCompound bNbt = nbt.getCompound("blocks");
-        if (bNbt.isEmpty()) { saveFile.delete(); return; }
+        if (bNbt.isEmpty()) { f.delete(); return; }
 
         pasteOriginX = nbt.getInt("refX");
         pasteOriginZ = nbt.getInt("refZ");
         pasteList    = new ArrayList<>(bNbt.getKeys().stream()
-                .map(k -> Map.entry(k, bNbt.getString(k))).toList());
+                           .map(k -> Map.entry(k, bNbt.getString(k))).toList());
         pasteIndex   = 0;
         pasteCount.set(0);
-
-        localMsg(client, "§eYapıştırılıyor: §f" + pasteList.size()
-                + " blok (her tick " + PASTE_PER_TICK + " blok)...");
+        localMsg(client, "§e▶ §fYapıştırma başladı: §e" + pasteList.size()
+                + " §fblok — her tick §e" + PASTE_PER_TICK + " §fblok.");
     }
 
-    // ── Incremental paste (called every tick) ─────────────────────────────────
+    // ── Paste — one small batch per tick ──────────────────────────────────────
 
     private void tickPaste(MinecraftClient client) {
         IntegratedServer server = client.getServer();
         if (server == null || client.player == null) return;
-
         ServerWorld sw = server.getWorld(World.OVERWORLD);
         if (sw == null) return;
 
@@ -272,23 +282,22 @@ public class ChunkCopierClient implements ClientModInitializer {
             int relZ = Integer.parseInt(p[2]);
             Identifier id = Identifier.of(e.getValue());
             if (Registries.BLOCK.containsId(id)) {
-                Block block = Registries.BLOCK.get(id);
                 sw.setBlockState(
-                        new BlockPos(pasteOriginX + relX, y, pasteOriginZ + relZ),
-                        block.getDefaultState(), 3);
+                    new BlockPos(pasteOriginX + relX, y, pasteOriginZ + relZ),
+                    Registries.BLOCK.get(id).getDefaultState(), 3);
                 pasteCount.incrementAndGet();
             }
         }
         pasteIndex = end;
 
-        // Progress message every 5000 blocks
-        if (pasteIndex % 5000 < PASTE_PER_TICK) {
-            localMsg(client, "§7[CC] §eYapıştırılıyor... §f"
-                    + pasteIndex + " / " + pasteList.size());
+        // Progress log every ~5 000 blocks
+        if (pasteList.size() > 0 && (pasteIndex % 5000) < PASTE_PER_TICK) {
+            int pct = pasteIndex * 100 / pasteList.size();
+            localMsg(client, "§7[CC] §fYapıştırılıyor §e" + pct + "%"
+                    + " §7(" + pasteIndex + "/" + pasteList.size() + " blok)");
         }
 
         if (pasteIndex >= pasteList.size()) {
-            // Done — clean up
             getPendingPath(client).toFile().delete();
             localMsg(client, "§a✔ §fTamamlandı! §e" + pasteCount.get() + " §fblok yapıştırıldı.");
             pasteList  = null;
