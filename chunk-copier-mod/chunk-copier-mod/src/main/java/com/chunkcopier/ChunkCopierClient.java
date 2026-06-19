@@ -14,16 +14,15 @@ import net.minecraft.server.integrated.IntegratedServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
-import net.minecraft.util.WorldSavePath;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.WorldChunk;
-import net.minecraft.world.level.storage.LevelStorage;
 import org.lwjgl.glfw.GLFW;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -57,7 +56,9 @@ public class ChunkCopierClient implements ClientModInitializer {
         ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
             Thread t = new Thread(() -> {
-                try { Thread.sleep(3000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+                try { Thread.sleep(3000); } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt(); return;
+                }
                 client.execute(() -> tryPastePending(client));
             });
             t.setDaemon(true);
@@ -84,7 +85,7 @@ public class ChunkCopierClient implements ClientModInitializer {
                 refZ = start.getStartZ();
                 state = State.RECORDING;
                 localMsg(client, "§a● §fKayıt başladı! Etrafı gez, chunk'lar arka planda kopyalanıyor.");
-                localMsg(client, "§7G'ye tekrar bas → durdur ve 'ChunkCopierExport' dünyasına yapıştır.");
+                localMsg(client, "§7G'ye tekrar bas → durdur ve yapıştırmayı başlat.");
             }
             case RECORDING -> {
                 state = State.PENDING_PASTE;
@@ -93,13 +94,15 @@ public class ChunkCopierClient implements ClientModInitializer {
                     state = State.IDLE;
                     return;
                 }
-                localMsg(client, "§a✔ §f" + copiedBlocks.size() + " blok / " + scannedChunks.size()
-                        + " chunk kopyalandı. Dünya açılıyor...");
-                Thread t = new Thread(() -> { savePending(client); openOrCreateWorld(client); });
+                localMsg(client, "§a✔ §f" + copiedBlocks.size() + " blok / " + scannedChunks.size() + " chunk kopyalandı.");
+                Thread t = new Thread(() -> {
+                    savePending(client);
+                    prepareExportWorld(client);
+                });
                 t.setDaemon(true);
                 t.start();
             }
-            case PENDING_PASTE -> localMsg(client, "§6Zaten bekleyen bir yapıştırma var. Dünyaya gir.");
+            case PENDING_PASTE -> localMsg(client, "§6Zaten bekleyen bir yapıştırma var. ChunkCopierExport dünyasına gir.");
         }
     }
 
@@ -165,51 +168,45 @@ public class ChunkCopierClient implements ClientModInitializer {
         }
     }
 
-    private void openOrCreateWorld(MinecraftClient client) {
-        LevelStorage storage = client.getLevelStorage();
+    /**
+     * Level.dat'ı doğrudan GZIP+NBT olarak yazar.
+     * NbtIo.writeCompressed() veya start() kullanmıyoruz — her ikisi de bozuk sonuç üretiyordu.
+     */
+    private void prepareExportWorld(MinecraftClient client) {
+        // Saves klasörünü bul: launcher fark etmeksizin runDirectory/saves/ standardtır
+        Path savesDir = client.runDirectory.toPath().resolve("saves");
+        Path worldDir = savesDir.resolve(WORLD_NAME);
 
-        // Eski bozuk klasörü sil
-        try {
-            boolean exists = storage.levelExists(WORLD_NAME);
-            if (exists) {
-                // Eski dünya var — session aç, klasörü bul, kapat, sil
-                try (LevelStorage.Session old = storage.createSession(WORLD_NAME)) {
-                    Path oldDir = old.getDirectory(WorldSavePath.ROOT).getParent();
-                    old.close();
-                    deleteDirectory(oldDir.toFile());
-                } catch (Exception ignored) {}
-            }
-        } catch (Exception ignored) {}
+        // Eski bozuk klasörü temizle
+        deleteDirectory(worldDir.toFile());
 
-        // Temiz session oluştur ve level.dat yaz
-        LevelStorage.Session session;
         try {
-            session = storage.createSession(WORLD_NAME);
-            writeLevelDat(session.getDirectory(WorldSavePath.ROOT).resolve("level.dat"));
-            client.execute(() -> localMsg(client, "§7'ChunkCopierExport' hazırlandı."));
+            Files.createDirectories(worldDir);
+            writeLevelDatManual(worldDir.resolve("level.dat"));
         } catch (Exception e) {
             client.execute(() -> localMsg(client, "§cDünya oluşturulamadı: " + e.getMessage()));
             return;
         }
 
-        // start(session) — session'ı IntegratedServerLoader'a devret, o yönetir
-        final LevelStorage.Session finalSession = session;
         client.execute(() -> {
-            localMsg(client, "§a→ §fChunkCopierExport açılıyor...");
-            client.createIntegratedServerLoader().start(finalSession, () -> {});
+            localMsg(client, "§a✔ §f'ChunkCopierExport' hazır!");
+            localMsg(client, "§e→ §fEsc § tuşu →§e Singleplayer §f→§e ChunkCopierExport §fseç → §eGir");
+            localMsg(client, "§7Girince bloklar otomatik yapıştırılacak.");
         });
     }
 
-    private void writeLevelDat(Path path) throws IOException {
+    /**
+     * Standart Minecraft level.dat formatında GZIP+NBT dosyası yazar.
+     * TAG_Compound (10) + boş isim + içerik formatı.
+     */
+    private void writeLevelDatManual(Path path) throws IOException {
         NbtCompound root = new NbtCompound();
-
-        // DataVersion hem root hem Data içinde — Minecraft farklı versiyonlarda farklı yerden okuyabiliyor
         root.putInt("DataVersion", DATA_VERSION);
 
         NbtCompound data = new NbtCompound();
         data.putInt("DataVersion", DATA_VERSION);
         data.putString("LevelName", WORLD_NAME);
-        data.putInt("GameType", 1);
+        data.putInt("GameType", 1);           // Creative
         data.putByte("Difficulty", (byte) 1);
         data.putByte("allowCommands", (byte) 1);
         data.putByte("hardcore", (byte) 0);
@@ -221,7 +218,8 @@ public class ChunkCopierClient implements ClientModInitializer {
         data.putFloat("SpawnAngle", 0f);
         data.putLong("Time", 0L);
         data.putLong("DayTime", 6000L);
-        data.putByte("initialized", (byte) 0);
+        // initialized=1 → Minecraft dünyayı yeniden init etmeye çalışmaz
+        data.putByte("initialized", (byte) 1);
 
         NbtCompound version = new NbtCompound();
         version.putInt("Id", DATA_VERSION);
@@ -237,7 +235,27 @@ public class ChunkCopierClient implements ClientModInitializer {
         gameRules.putString("keepInventory", "true");
         data.put("GameRules", gameRules);
 
+        // WorldGenSettings — normal overworld (flat'ten daha az kırılgan)
+        NbtCompound wgs  = new NbtCompound();
+        wgs.putLong("seed", 0L);
+        NbtCompound dims = new NbtCompound();
+
+        NbtCompound ow    = new NbtCompound();
+        ow.putString("type", "minecraft:overworld");
+        NbtCompound owGen = new NbtCompound();
+        owGen.putString("type", "minecraft:noise");
+        owGen.putString("settings", "minecraft:overworld");
+        NbtCompound owBiome = new NbtCompound();
+        owBiome.putString("type", "minecraft:multi_noise");
+        owBiome.putString("preset", "minecraft:overworld");
+        owGen.put("biome_source", owBiome);
+        ow.put("generator", owGen);
+        dims.put("minecraft:overworld", ow);
+        wgs.put("dimensions", dims);
+        data.put("WorldGenSettings", wgs);
+
         root.put("Data", data);
+
         NbtIo.writeCompressed(root, path);
     }
 
